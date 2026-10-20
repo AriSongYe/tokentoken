@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+installer/build/
+TokenToken-Setup-*.exe
+*.bak_tokentoken
+git_push.bat
+*.bundle
