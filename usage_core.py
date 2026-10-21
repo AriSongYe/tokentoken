@@ -7,7 +7,10 @@ Reads local session logs written by
 and (optionally) the Claude subscription limit endpoint used by Claude Code's
 own /usage screen, authenticated with the local Claude Code login.
 
-Standard library only. Shared by the desktop widget and the MCP server.
+It can also pull the same snapshot from TokenToken agents running on other
+machines (e.g. a VM where Claude Code actually runs) - see tokentoken_agent.py.
+
+Standard library only. Shared by the desktop widget, the MCP server and the agent.
 """
 import glob
 import json
@@ -549,20 +552,81 @@ class CodexCollector:
         }
 
 
+# ----------------------------------------------------------------- remote agents
+class RemoteSource:
+    """Polls a TokenToken agent (tokentoken_agent.py) on another machine."""
+    STALE_SEC = 180
+
+    def __init__(self, cfg):
+        self.url = str(cfg.get("url") or "").strip().rstrip("/")
+        if self.url and "://" not in self.url:
+            self.url = "http://" + self.url
+        self.token = str(cfg.get("token") or "").strip()
+        self.name = str(cfg.get("name") or "").strip() or self.url.split("://")[-1].split(":")[0]
+        self.last = None
+        self.last_ok = 0.0
+        self.err = None
+
+    def fetch(self, now):
+        req = urllib.request.Request(self.url + "/snapshot", headers={
+            "Authorization": "Bearer " + self.token, "User-Agent": "tokentoken-monitor"})
+        try:
+            # agents live on the LAN / host-only network: never route them through a system proxy
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            if not isinstance(data, dict) or "claude_accounts" not in data:
+                raise ValueError("bad response")
+            self.last, self.last_ok, self.err = data, now, None
+        except urllib.error.HTTPError as e:
+            self.err = "토큰이 맞지 않음 (HTTP 401)" if e.code == 401 else "HTTP %s" % e.code
+        except Exception as e:  # refused, timeout, unreachable ...
+            reason = getattr(e, "reason", None)
+            self.err = "연결 실패 (%s)" % type(reason if isinstance(reason, BaseException) else e).__name__
+        return self._decorate(now)
+
+    def _decorate(self, now):
+        if not self.last:
+            return [{"available": False, "account": self.name, "remote": self.name,
+                     "error": "%s %s · %s" % (self.name, self.err or "응답 없음", self.url)}], None
+        stale = None
+        if self.err and now - self.last_ok > self.STALE_SEC:
+            stale = "%s %s · %s 기준 값" % (self.name, self.err, fmt_ago(self.last_ok, now))
+        accs = []
+        for a in self.last.get("claude_accounts") or []:
+            a = dict(a)
+            acc = a.get("account") or "?"
+            a["account"] = self.name if acc == "기본" else "%s/%s" % (self.name, acc)
+            a["remote"] = self.name
+            if stale:
+                a["limits_note"] = stale
+            accs.append(a)
+        codex = self.last.get("codex")
+        if isinstance(codex, dict) and codex.get("available") and (
+                codex.get("limits") or (codex.get("week") or {}).get("total")):
+            codex = dict(codex, remote=self.name)
+            if stale:
+                codex["limits_note"] = stale
+        else:
+            codex = None
+        return accs, codex
+
+
 # ----------------------------------------------------------------- facade
 class UsageMonitor:
     def __init__(self):
         self.claude = {}  # root -> ClaudeCollector
         self.codex = CodexCollector()
+        self.remotes = {}  # (url, token, name) -> RemoteSource
         self.lock = threading.Lock()
 
     def snapshot(self, use_claude_api=True, api_interval=90, claude_block_limit=0,
-                 claude_dirs=None, show_idle_claude=False):
+                 claude_dirs=None, show_idle_claude=False, remote_agents=None, include_local=True):
         with self.lock:
             now = time.time()
-            snap = {"generated_at": now, "claude_accounts": []}
+            snap = {"generated_at": now, "claude_accounts": [], "codex_remote": []}
             try:
-                for root in claude_roots(claude_dirs):
+                for root in (claude_roots(claude_dirs) if include_local else []):
                     if root not in self.claude:
                         self.claude[root] = ClaudeCollector(root)
                     acc = self.claude[root].collect(now, use_claude_api, api_interval, claude_block_limit)
@@ -571,11 +635,24 @@ class UsageMonitor:
                         snap["claude_accounts"].append(acc)
             except Exception as e:
                 snap["claude_accounts"].append({"available": False, "account": "?", "error": repr(e)})
+            for cfg in remote_agents or []:
+                if not isinstance(cfg, dict) or not cfg.get("url") or cfg.get("enabled") is False:
+                    continue
+                key = (cfg.get("url"), cfg.get("token"), cfg.get("name"))
+                if key not in self.remotes:
+                    self.remotes[key] = RemoteSource(cfg)
+                accs, codex = self.remotes[key].fetch(now)
+                snap["claude_accounts"].extend(accs)
+                if codex:
+                    snap["codex_remote"].append(codex)
             snap["claude_accounts"].sort(key=lambda a: -(a.get("last_activity") or 0))
-            try:
-                snap["codex"] = self.codex.collect(now)
-            except Exception as e:
-                snap["codex"] = {"available": False, "error": repr(e)}
+            if include_local:
+                try:
+                    snap["codex"] = self.codex.collect(now)
+                except Exception as e:
+                    snap["codex"] = {"available": False, "error": repr(e)}
+            else:
+                snap["codex"] = None
             return snap
 
 
@@ -590,7 +667,10 @@ def format_summary(snap, provider="all"):
         for a in accs:
             blocks.append(("claude", "Claude [%s]" % a.get("account", "?"), a))
     if provider in ("all", "codex"):
-        blocks.append(("codex", "Codex", snap.get("codex") or {}))
+        if snap.get("codex") is not None:
+            blocks.append(("codex", "Codex", snap.get("codex") or {}))
+        for c in snap.get("codex_remote") or []:
+            blocks.append(("codex", "Codex [%s]" % c.get("remote", "?"), c))
     lines = []
     for key, title, s in blocks:
         head = "■ " + title
@@ -605,8 +685,9 @@ def format_summary(snap, provider="all"):
             continue
         for lim in s.get("limits") or []:
             r = lim.get("resets_at")
-            lines.append("  %s 한도: %.0f%% 사용%s" % (
-                lim["name"], lim["used_percent"],
+            used = float(lim["used_percent"])
+            lines.append("  %s 한도: %.0f%% 남음 (%.0f%% 사용)%s" % (
+                lim["name"], max(0.0, 100.0 - used), used,
                 (" · %s 후 리셋" % fmt_duration(r - now)) if r else ""))
         if s.get("limits_note"):
             lines.append("    (" + s["limits_note"] + ")")

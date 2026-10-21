@@ -4,6 +4,7 @@ TokenToken - Claude / Codex token usage monitor (always-on-top, resizable widget
     pythonw tokenmon.pyw
 
 Drag anywhere to move, drag the ◢ corner to resize, right-click for options.
+Click + (bottom right) to add a to-do; click ☐ to complete, ✕ to remove, double-click to edit.
 """
 import json
 import os
@@ -22,7 +23,7 @@ APP = "TokenToken"
 IS_WIN = os.name == "nt"
 
 DEFAULTS = {
-    "geometry": "340x300+60+60",
+    "geometry": "340x460+60+60",
     "topmost": True,
     "frameless": True,
     "alpha": 0.95,
@@ -35,6 +36,10 @@ DEFAULTS = {
     "claude_dirs": [],         # optional: extra Claude Code config dirs (auto: ~/.claude, ~/.claude-*)
     "show_idle_claude": False, # also show config dirs with no recent use and no live login
     "theme": "dark",
+    "show_todos": True,        # to-do / goal list under the usage panel
+    "show_remaining": True,    # show limits as % remaining (100 - used) instead of % used
+    "show_local": True,        # this PC's own Claude Code / Codex logs
+    "remote_agents": [],       # [{"name": "vm", "url": "http://192.168.0.63:8787", "token": "..."}]
 }
 
 THEMES = {
@@ -68,6 +73,29 @@ def save_config(cfg):
     try:
         with open(config_path(), "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def todos_path():
+    return os.path.join(os.path.dirname(config_path()), "todos.json")
+
+
+def load_todos():
+    try:
+        with open(todos_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [d for d in data if isinstance(d, dict) and str(d.get("text", "")).strip()]
+    except Exception:
+        return []
+
+
+def save_todos(items):
+    try:
+        tmp = todos_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, todos_path())
     except Exception:
         pass
 
@@ -136,8 +164,9 @@ def already_running():
         return False
 
 
-def bar_color(pct):
-    return OK if pct < 60 else WARN if pct < 85 else BAD
+def bar_color(used_pct):
+    """Color by how much of the limit is used (green -> amber -> red)."""
+    return OK if used_pct < 60 else WARN if used_pct < 85 else BAD
 
 
 class App:
@@ -149,6 +178,9 @@ class App:
         self._wake = threading.Event()
         self._compact = None
         self._layout_key = None
+        self.todos = load_todos()
+        self._edit_idx = None
+        self._todo_w = None
 
         if IS_WIN:
             try:
@@ -173,10 +205,12 @@ class App:
         self.f_main = tkfont.Font(family=fam, size=9)
         self.f_bold = tkfont.Font(family=fam, size=9, weight="bold")
         self.f_small = tkfont.Font(family=fam, size=8)
+        self.f_strike = tkfont.Font(family=fam, size=9, overstrike=1)
         self.f_base = None
 
         self.vars = {k: tk.BooleanVar(value=bool(self.cfg[k]))
-                     for k in ("topmost", "frameless", "show_claude", "show_codex", "claude_api")}
+                     for k in ("topmost", "frameless", "show_claude", "show_codex", "claude_api",
+                               "show_todos", "show_remaining", "show_local")}
         self.v_alpha = tk.DoubleVar(value=self.cfg["alpha"])
         self.v_refresh = tk.IntVar(value=self.cfg["refresh_sec"])
         self.v_theme = tk.StringVar(value=self.cfg.get("theme", "dark"))
@@ -188,6 +222,9 @@ class App:
 
         self.root.bind("<Configure>", self._on_configure)
         self.root.bind_all("<Button-3>", self._popup)
+        self.root.bind_all("<MouseWheel>", self._todo_wheel)
+        self.root.bind_all("<Button-4>", self._todo_wheel)
+        self.root.bind_all("<Button-5>", self._todo_wheel)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         threading.Thread(target=self._worker, daemon=True).start()
@@ -240,16 +277,29 @@ class App:
         self.body = tk.Frame(self.outer, bg=t["bg"])
         self.body.pack(fill="both", expand=True, padx=8)
 
-        self.footer = tk.Label(self.outer, text="불러오는 중…", font=self.f_small,
+        # footer row: status text on the left, "+" (add to-do) on the right
+        self.foot = tk.Frame(self.outer, bg=t["bg"])
+        self.footer = tk.Label(self.foot, text="불러오는 중…", font=self.f_small,
                                bg=t["bg"], fg=t["dim"], anchor="w")
-        self.footer.pack(fill="x", padx=8, pady=(0, 4))
+        self.footer.pack(side="left", fill="x", expand=True)
+        self.btn_add = tk.Label(self.foot, text="＋", font=self.f_title, bg=t["bg"], fg=t["dim"],
+                                cursor="hand2")
+        self.btn_add.pack(side="right")
+        self.btn_add.bind("<Button-1>", lambda e: self.todo_add_start())
+        self.btn_add.bind("<Enter>", lambda e: self.btn_add.configure(fg=ACCENT["claude"]))
+        self.btn_add.bind("<Leave>", lambda e: self.btn_add.configure(fg=self.t["dim"]))
+
+        self.todo = tk.Frame(self.outer, bg=t["bg"])
+        self._build_todo()
+        self._pack_lower()
 
         self.grip = tk.Label(self.outer, text="◢", font=self.f_small, bg=t["bg"],
                              fg=t["dim"], cursor="size_nw_se" if IS_WIN else "bottom_right_corner")
         self.grip.bind("<ButtonPress-1>", self._grip_start)
         self.grip.bind("<B1-Motion>", self._grip_move)
         self.grip.bind("<ButtonRelease-1>", lambda e: self._save_geometry())
-        self._nodrag = {self.btn_close, self.btn_refresh, self.btn_pin, self.grip}
+        self._nodrag = {self.btn_close, self.btn_refresh, self.btn_pin, self.grip,
+                        self.btn_add, self.todo_entry, self.todo_cv}
         self._bind_drag(self.outer)
 
     def _btn(self, text, cmd):
@@ -311,13 +361,20 @@ class App:
         theme.add_radiobutton(label="라이트", value="light", variable=self.v_theme, command=self._on_theme)
         m.add_cascade(label="테마", menu=theme)
         m.add_separator()
+        m.add_command(label="원격 PC(VM) 연결…", command=self.remote_dialog)
+        m.add_checkbutton(label="이 PC 기록 표시", variable=self.vars["show_local"], command=self._on_opts)
         m.add_checkbutton(label="Claude 표시", variable=self.vars["show_claude"], command=self._on_opts)
         m.add_checkbutton(label="Codex 표시", variable=self.vars["show_codex"], command=self._on_opts)
         m.add_checkbutton(label="Claude 구독 한도(%) 조회", variable=self.vars["claude_api"], command=self._on_opts)
+        m.add_checkbutton(label="남은 한도(%)로 표시", variable=self.vars["show_remaining"], command=self._on_opts)
         ref = tk.Menu(m, tearoff=0)
         for s in (10, 30, 60, 120, 300):
             ref.add_radiobutton(label="%d초" % s, value=s, variable=self.v_refresh, command=self._on_opts)
         m.add_cascade(label="새로고침 주기", menu=ref)
+        m.add_separator()
+        m.add_checkbutton(label="할 일 목록 표시", variable=self.vars["show_todos"], command=self._on_todo_visible)
+        m.add_command(label="할 일 추가", command=self.todo_add_start)
+        m.add_command(label="완료한 할 일 지우기", command=self.todo_clear_done)
         m.add_separator()
         m.add_command(label="MCP 서버 등록 (Claude / Codex)", command=self.install_mcp)
         if IS_WIN:
@@ -350,7 +407,7 @@ class App:
         self._apply_window_flags()
 
     def _on_opts(self):
-        for k in ("show_claude", "show_codex", "claude_api"):
+        for k in ("show_claude", "show_codex", "claude_api", "show_remaining", "show_local"):
             self.cfg[k] = self.vars[k].get()
         self.cfg["refresh_sec"] = int(self.v_refresh.get())
         save_config(self.cfg)
@@ -361,13 +418,20 @@ class App:
         self.cfg["theme"] = self.v_theme.get()
         save_config(self.cfg)
         for w in (self.outer, self.header, self.body, self.footer, self.grip, self.lbl_title,
-                  self.btn_close, self.btn_refresh, self.btn_pin):
+                  self.btn_close, self.btn_refresh, self.btn_pin, self.foot, self.btn_add,
+                  self.todo, self.todo_head, self.lbl_todo, self.todo_entry_row, self.todo_cv,
+                  self.todo_list):
             w.configure(bg=self.t["bg"])
+        self.todo_sep.configure(bg=self.t["line"])
+        self.lbl_todo.configure(fg=self.t["fg"])
+        self.todo_entry.configure(bg=self.t["panel"], fg=self.t["fg"], insertbackground=self.t["fg"],
+                                  highlightbackground=self.t["line"])
         self.root.configure(bg=self.t["line"])
         self.lbl_title.configure(fg=self.t["fg"])
-        for w in (self.footer, self.grip, self.btn_close, self.btn_refresh):
+        for w in (self.footer, self.grip, self.btn_close, self.btn_refresh, self.btn_add):
             w.configure(fg=self.t["dim"])
         self._update_pin()
+        self._render_todos()
         self._layout_key = None
         self.render()
 
@@ -394,6 +458,89 @@ class App:
         except Exception as e:
             messagebox.showerror(APP, "등록 실패: %r" % e)
 
+    # ------------------------------------------------------------ remote agent dialog
+    def remote_dialog(self):
+        """Connect to a TokenToken agent on another machine (tokentoken_agent.py)."""
+        t = self.t
+        agents = self.cfg.get("remote_agents") or []
+        cur = agents[0] if agents else {}
+        d = tk.Toplevel(self.root)
+        d.title("원격 PC 연결")
+        d.configure(bg=t["bg"])
+        d.attributes("-topmost", True)
+        d.resizable(False, False)
+        d.transient(self.root)
+        tk.Label(d, text="VM / 다른 PC에서 tokentoken_agent.py 를 실행하면 나오는\n주소와 토큰을 입력하세요.",
+                 font=self.f_small, bg=t["bg"], fg=t["dim"], justify="left").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 6))
+        fields = {}
+        for i, (k, label, val) in enumerate((
+                ("url", "주소", cur.get("url") or "http://192.168.0.63:8787"),
+                ("token", "토큰", cur.get("token") or ""),
+                ("name", "이름", cur.get("name") or "vm"))):
+            tk.Label(d, text=label, font=self.f_main, bg=t["bg"], fg=t["fg"]).grid(
+                row=i + 1, column=0, sticky="w", padx=(12, 6), pady=3)
+            e = tk.Entry(d, font=self.f_main, width=34, bg=t["panel"], fg=t["fg"], insertbackground=t["fg"],
+                         relief="flat", highlightthickness=1, highlightbackground=t["line"],
+                         highlightcolor=ACCENT["claude"])
+            e.insert(0, val)
+            e.grid(row=i + 1, column=1, sticky="ew", padx=(0, 12), pady=3, ipady=2)
+            fields[k] = e
+        status = tk.Label(d, text="", font=self.f_small, bg=t["bg"], fg=t["dim"], anchor="w", justify="left",
+                          wraplength=320)
+        status.grid(row=4, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        if len(agents) > 1:
+            status.configure(text="원격 %d개 중 첫 번째만 여기서 편집합니다 (나머지는 config.json)." % len(agents))
+
+        def values():
+            return {k: fields[k].get().strip() for k in fields}
+
+        def test():
+            import usage_core
+            v = values()
+            if not v["url"]:
+                return
+            status.configure(text="연결 중…", fg=t["dim"])
+            d.update_idletasks()
+            src = usage_core.RemoteSource(v)
+            accs, codex = src.fetch(time.time())
+            if src.err:
+                status.configure(text="실패: " + src.err, fg=BAD)
+            else:
+                names = [a.get("account") for a in accs] + (["Codex"] if codex else [])
+                status.configure(text="성공: " + (", ".join(names) or "데이터 없음 (아직 사용 기록이 없을 수 있음)"),
+                                 fg=OK)
+
+        def save():
+            v = values()
+            rest = agents[1:]
+            self.cfg["remote_agents"] = ([v] if v["url"] else []) + rest
+            save_config(self.cfg)
+            d.destroy()
+            self._layout_key = None
+            self.refresh_now()
+
+        def remove():
+            fields["url"].delete(0, "end")
+            save()
+
+        bar = tk.Frame(d, bg=t["bg"])
+        bar.grid(row=5, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        for text, cmd in (("연결 테스트", test), ("연결 해제", remove), ("취소", d.destroy), ("저장", save)):
+            tk.Button(bar, text=text, command=cmd, font=self.f_small, relief="flat", bg=t["panel"], fg=t["fg"],
+                      activebackground=t["track"], activeforeground=t["fg"], padx=8).pack(side="left", padx=(6, 0))
+        d.bind("<Return>", lambda e: save())
+        d.bind("<Escape>", lambda e: d.destroy())
+        d.update_idletasks()
+        x = self.root.winfo_rootx() + 20
+        y = self.root.winfo_rooty() + 40
+        d.geometry("+%d+%d" % (x, y))
+        try:
+            d.focus_force()
+            fields["token" if cur.get("url") else "url"].focus_set()
+        except tk.TclError:
+            pass
+
     # ------------------------------------------------------------ data
     def _worker(self):
         while True:
@@ -403,7 +550,9 @@ class App:
                     api_interval=int(self.cfg.get("claude_api_interval", 90)),
                     claude_block_limit=int(self.cfg.get("claude_block_limit", 0) or 0),
                     claude_dirs=self.cfg.get("claude_dirs") or [],
-                    show_idle_claude=bool(self.cfg.get("show_idle_claude")))
+                    show_idle_claude=bool(self.cfg.get("show_idle_claude")),
+                    remote_agents=self.cfg.get("remote_agents") or [],
+                    include_local=self.cfg.get("show_local", True) is not False)
             except Exception as e:
                 snap = {"generated_at": time.time(), "error": repr(e)}
             self._pending = snap
@@ -445,9 +594,13 @@ class App:
                 a["_short"] = "C" if len(accs) == 1 else a.get("account", "C")[:4]
                 out.append(("claude", label, a))
         if self.vars["show_codex"].get():
-            s = self.snap.get("codex") or {}
-            s["_short"] = "X"
-            out.append(("codex", "Codex", s))
+            s = self.snap.get("codex")
+            if s is not None:
+                s["_short"] = "X"
+                out.append(("codex", "Codex", s))
+            for c in self.snap.get("codex_remote") or []:
+                c["_short"] = "X" + c.get("remote", "")[:3]
+                out.append(("codex", "Codex · " + c.get("remote", "?"), c))
         return out
 
     def _rows_needed(self, compact):
@@ -455,6 +608,8 @@ class App:
         for _, _, s in self._sections():
             n = max(1, len(s.get("limits") or []))
             rows += (n + 0.4) if compact else (n + 2.6)
+        if not compact and self.vars["show_todos"].get():
+            rows += 3  # to-do header + at least one visible item
         return rows + (0 if compact else 1)
 
     def _on_configure(self, e):
@@ -476,21 +631,181 @@ class App:
             self.f_bold.configure(size=size)
             self.f_title.configure(size=size + 1)
             self.f_small.configure(size=max(6, size - 1))
+            self.f_strike.configure(size=size)
+            self._todo_w = None
             for c in self.body.winfo_children():
                 for cv in getattr(c, "_bars", []):
                     cv.configure(height=self._bar_h())
         if compact != self._compact:
             self._compact = compact
             self._layout_key = None
-            if compact:
-                self.footer.pack_forget()
-            else:
-                self.footer.pack(fill="x", padx=8, pady=(0, 4))
+            self._pack_lower()
             self.render()
+        if w != self._todo_w and not compact:
+            self._todo_w = w
+            self._render_todos()
         self.grip.lift()
 
     def _bar_h(self):
         return max(4, int(self.f_main.metrics("linespace") * 0.45))
+
+    # ------------------------------------------------------------ to-do list
+    def _pack_lower(self):
+        """(Re)pack footer + to-do panel in order; both are hidden in compact mode."""
+        self.foot.pack_forget()
+        self.todo.pack_forget()
+        show = bool(self.vars["show_todos"].get())
+        self.body.pack_configure(expand=not show)
+        if self._compact:
+            return
+        self.foot.pack(fill="x", padx=8, pady=(2, 2))
+        if show:
+            self.todo.pack(fill="both", expand=True, padx=8, pady=(0, 14))
+
+    def _build_todo(self):
+        t = self.t
+        self.todo_head = tk.Frame(self.todo, bg=t["bg"])
+        self.todo_head.pack(fill="x")
+        self.todo_sep = tk.Frame(self.todo_head, bg=t["line"], height=1)
+        self.todo_sep.pack(fill="x", pady=(2, 4))
+        self.lbl_todo = tk.Label(self.todo_head, text="할 일", font=self.f_bold, bg=t["bg"], fg=t["fg"],
+                                 anchor="w")
+        self.lbl_todo.pack(side="left")
+
+        self.todo_entry_row = tk.Frame(self.todo, bg=t["bg"])  # packed only while adding / editing
+        self.todo_entry = tk.Entry(self.todo_entry_row, font=self.f_main, bg=t["panel"], fg=t["fg"],
+                                   insertbackground=t["fg"], relief="flat", highlightthickness=1,
+                                   highlightbackground=t["line"], highlightcolor=ACCENT["claude"])
+        self.todo_entry.pack(fill="x", expand=True, ipady=3)
+        self.todo_entry.bind("<Return>", lambda e: self._todo_commit())
+        self.todo_entry.bind("<KP_Enter>", lambda e: self._todo_commit())
+        self.todo_entry.bind("<Escape>", lambda e: self._todo_cancel())
+
+        self.todo_cv = tk.Canvas(self.todo, bg=t["bg"], highlightthickness=0, bd=0, yscrollincrement=12)
+        self.todo_cv.pack(fill="both", expand=True, pady=(4, 0))
+        self.todo_list = tk.Frame(self.todo_cv, bg=t["bg"])
+        self._todo_win = self.todo_cv.create_window(0, 0, window=self.todo_list, anchor="nw")
+        self.todo_list.bind("<Configure>", lambda e: self._todo_sync_scroll())
+        self.todo_cv.bind("<Configure>", lambda e: (
+            self.todo_cv.itemconfigure(self._todo_win, width=e.width), self._todo_sync_scroll()))
+
+    def _todo_sync_scroll(self):
+        cv = self.todo_cv
+        cv.configure(scrollregion=(0, 0, cv.winfo_width(), max(cv.winfo_height(),
+                                                               self.todo_list.winfo_reqheight())))
+
+    def _todo_wheel(self, e):
+        w = self.root.winfo_containing(e.x_root, e.y_root)
+        if w is None or not str(w).startswith(str(self.todo_cv)):
+            return
+        if self.todo_list.winfo_reqheight() <= self.todo_cv.winfo_height():
+            return
+        up = getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0
+        self.todo_cv.yview_scroll(-3 if up else 3, "units")
+
+    def _render_todos(self):
+        t = self.t
+        for c in self.todo_list.winfo_children():
+            c.destroy()
+        done = sum(1 for d in self.todos if d.get("done"))
+        self.lbl_todo.configure(text=("할 일  %d/%d" % (done, len(self.todos))) if self.todos else "할 일")
+        if not self.todos and not self.todo_entry_row.winfo_ismapped():
+            tk.Label(self.todo_list, text="＋ 를 눌러 목표를 추가하세요", font=self.f_small,
+                     bg=t["bg"], fg=t["dim"], anchor="w").pack(fill="x", pady=2)
+        wrap = max(60, self.root.winfo_width() - 16 - 2 * self.f_main.measure("☐✕") - 30)
+        for i, d in enumerate(self.todos):
+            is_done = bool(d.get("done"))
+            row = tk.Frame(self.todo_list, bg=t["panel"])
+            row.pack(fill="x", pady=(0, 3))
+            chk = tk.Label(row, text="☑" if is_done else "☐", font=self.f_main, bg=t["panel"],
+                           fg=OK if is_done else t["dim"], cursor="hand2")
+            chk.pack(side="left", anchor="n", padx=(6, 4), pady=3)
+            chk.bind("<Button-1>", lambda e, i=i: self._todo_toggle(i))
+            x = tk.Label(row, text="✕", font=self.f_small, bg=t["panel"], fg=t["dim"], cursor="hand2")
+            x.pack(side="right", anchor="n", padx=(4, 6), pady=4)
+            x.bind("<Button-1>", lambda e, i=i: self._todo_delete(i))
+            x.bind("<Enter>", lambda e, x=x: x.configure(fg=BAD))
+            x.bind("<Leave>", lambda e, x=x: x.configure(fg=self.t["dim"]))
+            txt = tk.Label(row, text=d["text"], font=self.f_strike if is_done else self.f_main,
+                           bg=t["panel"], fg=t["dim"] if is_done else t["fg"], anchor="w",
+                           justify="left", wraplength=wrap)
+            txt.pack(side="left", fill="x", expand=True, pady=3)
+            txt.bind("<Double-Button-1>", lambda e, i=i: self.todo_add_start(i))
+        self.todo_cv.yview_moveto(min(1.0, self.todo_cv.yview()[0]))
+
+    def _todo_save(self):
+        save_todos(self.todos)
+        self._render_todos()
+
+    def _todo_toggle(self, i):
+        if 0 <= i < len(self.todos):
+            self.todos[i]["done"] = not self.todos[i].get("done")
+            self.todos[i]["done_at"] = time.time() if self.todos[i]["done"] else None
+            self._todo_save()
+
+    def _todo_delete(self, i):
+        if 0 <= i < len(self.todos):
+            del self.todos[i]
+            if self._edit_idx is not None:
+                self._todo_cancel()
+            self._todo_save()
+
+    def todo_clear_done(self):
+        self.todos = [d for d in self.todos if not d.get("done")]
+        self._todo_save()
+
+    def todo_add_start(self, idx=None):
+        """Open the input row. idx=None adds a new item, otherwise edits that item."""
+        if not self.vars["show_todos"].get():
+            self.vars["show_todos"].set(True)
+            self._on_todo_visible()
+        if idx is None and self.todo_entry_row.winfo_ismapped() and self._edit_idx is None \
+                and not self.todo_entry.get().strip():
+            self._todo_cancel()  # "+" again on an empty input closes it
+            return
+        self._edit_idx = idx
+        self.todo_entry.delete(0, "end")
+        if idx is not None and 0 <= idx < len(self.todos):
+            self.todo_entry.insert(0, self.todos[idx]["text"])
+            self.todo_entry.select_range(0, "end")
+        if not self.todo_entry_row.winfo_ismapped():
+            self.todo_entry_row.pack(fill="x", pady=(2, 0), before=self.todo_cv)
+        self._render_todos()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self.todo_entry.focus_set()
+
+    def _todo_commit(self):
+        text = self.todo_entry.get().strip()
+        editing = self._edit_idx is not None
+        if text:
+            if editing and 0 <= self._edit_idx < len(self.todos):
+                self.todos[self._edit_idx]["text"] = text
+            elif not editing:
+                self.todos.append({"text": text, "done": False, "created": time.time()})
+        if editing or not text:
+            self._todo_cancel()
+        else:
+            self.todo_entry.delete(0, "end")  # stay open for quick multi-add
+        self._todo_save()
+        if text and not editing:
+            self.root.update_idletasks()
+            self.todo_cv.yview_moveto(1.0)
+
+    def _todo_cancel(self):
+        self._edit_idx = None
+        self.todo_entry.delete(0, "end")
+        self.todo_entry_row.pack_forget()
+        self._render_todos()
+
+    def _on_todo_visible(self):
+        self.cfg["show_todos"] = self.vars["show_todos"].get()
+        save_config(self.cfg)
+        self._compact = None   # force re-layout
+        self._layout_key = None
+        self._rescale()
 
     # ------------------------------------------------------------ render
     def render(self):
@@ -546,10 +861,12 @@ class App:
                 row=row, column=0, sticky="w", padx=(0, 6))
             cv = tk.Canvas(sec, height=self._bar_h(), bg=t["bg"], highlightthickness=0, bd=0)
             cv.grid(row=row, column=1, sticky="ew")
-            pct = float(lim["used_percent"])
-            cv.bind("<Configure>", lambda e, c=cv, p=pct: self._draw_bar(c, p))
+            used = float(lim["used_percent"])
+            # remaining mode: bar/number show what's left (100 - used); color still follows usage
+            pct = max(0.0, 100.0 - used) if self.vars["show_remaining"].get() else used
+            cv.bind("<Configure>", lambda e, c=cv, p=pct, u=used: self._draw_bar(c, p, u))
             sec._bars.append(cv)
-            tk.Label(sec, text="%d%%" % round(pct), font=self.f_bold, bg=t["bg"], fg=bar_color(pct),
+            tk.Label(sec, text="%d%%" % round(pct), font=self.f_bold, bg=t["bg"], fg=bar_color(used),
                      width=4, anchor="e").grid(row=row, column=2, sticky="e")
             r = lim.get("resets_at")
             tk.Label(sec, text=(fmt_duration(r - now) if r else "-"), font=self.f_small, bg=t["bg"],
@@ -563,7 +880,8 @@ class App:
             row += 1
         if s.get("error") or not s.get("available", True):
             msg = s.get("error") or ("Claude Code 기록 폴더 없음" if key == "claude" else "~/.codex 폴더 없음")
-            tk.Label(sec, text=msg, font=self.f_small, bg=t["bg"], fg=t["dim"], anchor="w").grid(
+            tk.Label(sec, text=msg, font=self.f_small, bg=t["bg"], fg=BAD if s.get("remote") else t["dim"],
+                     anchor="w", justify="left", wraplength=max(80, self.root.winfo_width() - 24)).grid(
                 row=row, column=0, columnspan=4, sticky="w")
             return
         if not limits:
@@ -594,7 +912,7 @@ class App:
         tk.Label(sec, text=sub, font=self.f_small, bg=t["bg"], fg=t["dim"], anchor="w").grid(
             row=row + 1, column=0, columnspan=4, sticky="w")
 
-    def _draw_bar(self, cv, pct):
+    def _draw_bar(self, cv, pct, used):
         cv.delete("all")
         w, h = cv.winfo_width(), cv.winfo_height()
         if w < 4:
@@ -602,7 +920,7 @@ class App:
         cv.create_rectangle(0, 0, w, h, fill=self.t["track"], width=0)
         fw = int(w * max(0.0, min(100.0, pct)) / 100.0)
         if fw > 0:
-            cv.create_rectangle(0, 0, fw, h, fill=bar_color(pct), width=0)
+            cv.create_rectangle(0, 0, fw, h, fill=bar_color(used), width=0)
 
     # ------------------------------------------------------------ run
     def quit(self):

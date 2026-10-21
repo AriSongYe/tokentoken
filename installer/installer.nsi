@@ -5,7 +5,9 @@ ManifestDPIAware true
 !include "LogicLib.nsh"
 
 !define APP "TokenToken"
-!define VERSION "1.3.0"
+!define VERSION "1.4.0"
+; bump RUNTIME_ID whenever build_installer.sh switches to a different Python build
+!define RUNTIME_ID "cpython-3.12.11+20250612"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -16,7 +18,7 @@ InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 BrandingText "${APP} ${VERSION}"
-VIProductVersion "1.3.0.0"
+VIProductVersion "1.4.0.0"
 VIAddVersionKey /LANG=1042 "ProductName" "${APP}"
 VIAddVersionKey /LANG=1042 "FileDescription" "${APP} 설치 프로그램"
 VIAddVersionKey /LANG=1042 "FileVersion" "${VERSION}"
@@ -53,17 +55,52 @@ VIAddVersionKey /LANG=1042 "ProductVersion" "${VERSION}"
   Sleep 500
 !macroend
 
+; $0 = 1 when the installed runtime is complete and matches RUNTIME_ID (then it is left alone,
+; so an MCP server that keeps runtime\python.exe busy can't break an upgrade)
+Function RuntimeIsCurrent
+  StrCpy $0 0
+  IfFileExists "$INSTDIR\runtime\pythonw.exe" 0 rt_done
+  IfFileExists "$INSTDIR\runtime\python312.dll" 0 rt_done
+  IfFileExists "$INSTDIR\runtime\Lib\os.py" 0 rt_done
+  IfFileExists "$INSTDIR\runtime\Lib\tkinter\__init__.py" 0 rt_done
+  ClearErrors
+  FileOpen $1 "$INSTDIR\runtime\runtime.id" r
+  IfErrors rt_done
+  FileRead $1 $2
+  FileClose $1
+  StrCmp $2 "${RUNTIME_ID}" 0 rt_done
+  StrCpy $0 1
+rt_done:
+FunctionEnd
+
 Section "TokenToken (필수)" SecCore
   SectionIn RO
   !insertmacro StopApp
   SetOutPath "$INSTDIR"
-  RMDir /r "$INSTDIR\runtime"
   File "TokenToken.exe"
   File "tokentoken.ico"
+  RMDir /r "$INSTDIR\app"
   SetOutPath "$INSTDIR\app"
   File /r "app\*.*"
-  SetOutPath "$INSTDIR\runtime"
-  File /r "runtime\*.*"
+
+  Call RuntimeIsCurrent
+  ${If} $0 != 1
+    ${Do}
+      RMDir /r "$INSTDIR\runtime"
+      ${IfNot} ${FileExists} "$INSTDIR\runtime\*.*"
+        ${Break}
+      ${EndIf}
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "TokenToken 런타임 파일이 사용 중이라 교체할 수 없습니다.$\r$\n$\r$\nClaude 데스크톱 앱, Claude Code, Codex가 TokenToken MCP 서버를 실행하고 있을 수 있습니다. 이 프로그램들을 모두 종료한 뒤 [다시 시도]를 누르세요." IDRETRY rt_retry
+      Abort "런타임 파일이 사용 중이라 설치를 중단했습니다."
+    rt_retry:
+      !insertmacro StopApp
+    ${Loop}
+    SetOutPath "$INSTDIR\runtime"
+    File /r "runtime\*.*"
+    FileOpen $1 "$INSTDIR\runtime\runtime.id" w
+    FileWrite $1 "${RUNTIME_ID}"
+    FileClose $1
+  ${EndIf}
   SetOutPath "$INSTDIR"
 
   CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\TokenToken.exe" "" "$INSTDIR\tokentoken.ico"

@@ -35,14 +35,14 @@ TOOLS = [{
 _monitor = UsageMonitor()
 
 
-def _extra_claude_dirs():
-    """Extra Claude config dirs listed in the widget's config (claude_dirs)."""
+def _widget_cfg():
+    """The widget's config.json (extra Claude dirs, remote agents, ...)."""
     base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
     try:
         with open(os.path.join(base, "TokenToken", "config.json"), "r", encoding="utf-8") as f:
-            return json.load(f).get("claude_dirs") or []
+            return json.load(f) or {}
     except Exception:
-        return []
+        return {}
 
 
 def _out(msg):
@@ -63,9 +63,13 @@ def _call_tool(name, args):
         raise KeyError(name)
     provider = (args or {}).get("provider") or "all"
     fmt = (args or {}).get("format") or "text"
-    snap = _monitor.snapshot(claude_dirs=_extra_claude_dirs())
+    cfg = _widget_cfg()
+    snap = _monitor.snapshot(claude_dirs=cfg.get("claude_dirs") or [],
+                             remote_agents=cfg.get("remote_agents") or [],
+                             include_local=cfg.get("show_local", True) is not False)
     if provider == "claude":
         snap.pop("codex", None)
+        snap.pop("codex_remote", None)
     elif provider == "codex":
         snap.pop("claude_accounts", None)
     text = json.dumps(snap, ensure_ascii=False, indent=1) if fmt == "json" else format_summary(snap, provider)
