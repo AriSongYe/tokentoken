@@ -5,7 +5,7 @@ ManifestDPIAware true
 !include "LogicLib.nsh"
 
 !define APP "TokenToken"
-!define VERSION "1.2.0"
+!define VERSION "1.3.0"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -16,7 +16,7 @@ InstallDirRegKey HKCU "${UNINST_KEY}" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 BrandingText "${APP} ${VERSION}"
-VIProductVersion "1.2.0.0"
+VIProductVersion "1.3.0.0"
 VIAddVersionKey /LANG=1042 "ProductName" "${APP}"
 VIAddVersionKey /LANG=1042 "FileDescription" "${APP} 설치 프로그램"
 VIAddVersionKey /LANG=1042 "FileVersion" "${VERSION}"
